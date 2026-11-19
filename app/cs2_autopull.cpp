@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/account_store/token_lifecycle.hpp"
 #include "core/cs2_gc/cs2_gc_client.hpp"
 #include "core/log.hpp"
 #include "core/steam_login/session.hpp"
@@ -219,6 +220,7 @@ void begin_validate(AppState& st) {
         return;
     }
     v.current_id = a->id;
+    v.token_at_start = cs2_client_token(*a);
     v.current_account_id = static_cast<std::uint32_t>(a->steam_id_64 & 0xffffffffULL);
     v.connected = false;
     v.pull_issued = false;
@@ -236,26 +238,34 @@ void begin_validate(AppState& st) {
     creds.proxy = std::string(a->proxy.begin(), a->proxy.end());
 
     AppState* stp = &st;
+    const std::string current_id = a->id;
+    const std::string token_at_start = v.token_at_start;
     cs2_gc::Cs2Callbacks cb;
-    cb.on_logon = [stp](int eresult) {
-        stp->post_ui_callback([stp, eresult] {
+    cb.on_logon = [stp, current_id, token_at_start](int eresult) {
+        stp->post_ui_callback([stp, current_id, token_at_start, eresult] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
+            if (!v.active || v.current_id != current_id ||
+                v.token_at_start != token_at_start) return;
             v.logon_seen = true;
             v.logon_eresult = eresult;
         });
     };
-    cb.on_status = [stp](std::string text) {
-        stp->post_ui_callback([stp, text = std::move(text)] {
+    cb.on_status = [stp, current_id, token_at_start](std::string text) {
+        stp->post_ui_callback([stp, current_id, token_at_start,
+                               text = std::move(text)] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
+            if (!v.active || v.current_id != current_id ||
+                v.token_at_start != token_at_start) return;
             if (text == "Ready") v.connected = true;
         });
     };
-    cb.on_profile = [stp](cs2_gc::ProfilePull pp) {
-        stp->post_ui_callback([stp, pp = std::move(pp)]() mutable {
+    cb.on_profile = [stp, current_id, token_at_start](cs2_gc::ProfilePull pp) {
+        stp->post_ui_callback([stp, current_id, token_at_start,
+                               pp = std::move(pp)]() mutable {
             GcValidate& v = stp->gc_validate;
-            if (!v.active || pp.account_id != v.current_account_id) return;
+            if (!v.active || v.current_id != current_id ||
+                v.token_at_start != token_at_start ||
+                pp.account_id != v.current_account_id) return;
             cs2_gc::Snapshot snap;
             snap.progress = pp.progress;
             snap.medals = std::move(pp.medals);
@@ -265,16 +275,19 @@ void begin_validate(AppState& st) {
             v.profile_applied = true;
         });
     };
-    cb.on_profiles_done = [stp](int, int) {
-        stp->post_ui_callback([stp] {
+    cb.on_profiles_done = [stp, current_id, token_at_start](int, int) {
+        stp->post_ui_callback([stp, current_id, token_at_start] {
             GcValidate& v = stp->gc_validate;
-            if (v.active) v.finished = true;
+            if (v.active && v.current_id == current_id &&
+                v.token_at_start == token_at_start) v.finished = true;
         });
     };
-    cb.on_error = [stp](std::string err) {
-        stp->post_ui_callback([stp, err = std::move(err)] {
+    cb.on_error = [stp, current_id, token_at_start](std::string err) {
+        stp->post_ui_callback([stp, current_id, token_at_start,
+                               err = std::move(err)] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
+            if (!v.active || v.current_id != current_id ||
+                v.token_at_start != token_at_start) return;
             SAM_LOG_WARN("gc-validate: error: {}", err);
             v.finished = true;
         });
@@ -315,10 +328,15 @@ void end_validate(AppState& st, std::string status) {
 }  // namespace
 
 std::string cs2_client_token(const core::Account& a) {
+    if (a.is_nfa && a.nfa_status == core::NfaTokenStatus::Revoked) return {};
+    if (!a.is_nfa && a.cm_status == core::NfaTokenStatus::Revoked) return {};
+    const std::int64_t now = now_unix();
     if (!a.cm_refresh_token.empty() &&
-        steam_login::jwt_audience(a.cm_refresh_token).find("client") != std::string::npos)
+        steam_login::jwt_audience(a.cm_refresh_token).find("client") != std::string::npos &&
+        steam_login::jwt_expiry(a.cm_refresh_token) > now)
         return std::string(a.cm_refresh_token.begin(), a.cm_refresh_token.end());
-    if (steam_login::jwt_audience(a.refresh_token).find("client") != std::string::npos)
+    if (steam_login::jwt_audience(a.refresh_token).find("client") != std::string::npos &&
+        steam_login::jwt_expiry(a.refresh_token) > now)
         return std::string(a.refresh_token.begin(), a.refresh_token.end());
     return {};
 }
@@ -444,15 +462,15 @@ std::vector<std::string> AppState::collect_nfa_validate_ids(bool force) {
 
     std::vector<std::string> queue;
     for (const auto& a : vault.accounts) {
-        if (!a.is_nfa) continue;
         if (a.steam_id_64 == 0) continue;
+        if (!a.is_nfa && a.cm_refresh_token.empty()) continue;
         if (cs2_client_token(a).empty()) continue;
         if (is_active_steam_user(a)) continue;
         if (is_manually_connected(*this, a.id)) continue;
 
-        if (!force && a.nfa_last_validated_unix != 0 &&
-            now - a.nfa_last_validated_unix < ttl)
-            continue;
+        const std::int64_t last_checked = a.is_nfa ? a.nfa_last_validated_unix
+                                                  : a.cm_last_validated_unix;
+        if (!force && last_checked != 0 && now - last_checked < ttl) continue;
         queue.push_back(a.id);
     }
     return queue;
@@ -471,7 +489,7 @@ void AppState::start_gc_validate(bool force) {
     }
     gc_validate.active = true;
     gc_validate.queue = std::move(queue);
-    gc_validate.status = "Validating NFA/cached accounts";
+    gc_validate.status = "Validating login tokens";
     SAM_LOG_INFO("gc-validate: {} account(s) queued", gc_validate.queue.size());
     begin_validate(*this);
 }
@@ -484,7 +502,7 @@ void AppState::start_gc_validate_feed(std::vector<std::string> ids) {
     gc_validate.active = true;
     gc_validate.feed_refresh_all = true;
     gc_validate.queue = std::move(ids);
-    gc_validate.status = "Refreshing NFA cooldowns";
+    gc_validate.status = "Refreshing tokens and GC data";
     SAM_LOG_INFO("gc-validate: {} account(s) queued (refresh-all)", gc_validate.queue.size());
     begin_validate(*this);
 }
@@ -526,38 +544,50 @@ void AppState::tick_gc_validate() {
     const bool timed_out = now - v.phase_started > kValidateTimeout;
     if (!v.finished && !timed_out) return;
 
-    if (auto* a = find_account(v.current_id); a != nullptr && a->is_nfa) {
-        const core::NfaTokenStatus prev = a->nfa_status;
+    if (auto* a = find_account(v.current_id);
+        a != nullptr && !v.token_at_start.empty() &&
+        cs2_client_token(*a) == v.token_at_start) {
+        const core::NfaTokenStatus prev = a->is_nfa ? a->nfa_status : a->cm_status;
+        const std::int64_t checked_at = now_unix();
+        bool changed = false;
         if (v.logon_seen && v.logon_eresult == 1) {
-            a->nfa_status = core::NfaTokenStatus::Valid;
-            a->nfa_last_validated_unix = now_unix();
-        } else if (v.logon_seen && v.logon_eresult != 0) {
-
-            a->nfa_status = core::NfaTokenStatus::Revoked;
-            a->nfa_last_validated_unix = now_unix();
+            if (a->is_nfa) {
+                a->nfa_status = core::NfaTokenStatus::Valid;
+                a->nfa_last_validated_unix = checked_at;
+            } else {
+                a->cm_status = core::NfaTokenStatus::Valid;
+                a->cm_last_validated_unix = checked_at;
+            }
+            changed = true;
+            nfa_dead_notified.erase(a->id);
+        } else if (v.logon_seen && core::is_rejected_login_token(v.logon_eresult)) {
+            // An explicit credential refusal is different from a CM timeout,
+            // game-session conflict or temporary Steam failure.
+            core::forget_rejected_login_token(*a);
+            if (a->is_nfa) a->nfa_last_validated_unix = checked_at;
+            else           a->cm_last_validated_unix = checked_at;
+            changed = true;
+            SAM_LOG_WARN("gc-validate: Steam rejected the login token for '{}' (eresult {})",
+                         a->login, v.logon_eresult);
+            if (prev != core::NfaTokenStatus::Revoked &&
+                nfa_dead_notified.insert(a->id).second) {
+                ui::widgets::ToastItem t;
+                t.id = "token-rejected-" + a->id;
+                t.message = "Login token rejected - " +
+                    (a->web.persona_name.empty() ? a->login : a->web.persona_name) +
+                    (a->is_nfa ? " (import a new token)" : " (Mint token to replace it)");
+                t.account_id = a->id;
+                t.is_warning = true;
+                t.expires_at_unix = checked_at + settings.notifications.toast_duration_seconds;
+                toasts.push(std::move(t));
+            }
+        } else if (v.logon_seen) {
+            SAM_LOG_INFO("gc-validate: '{}' could not be verified (eresult {}); keeping token",
+                         a->login, v.logon_eresult);
         }
-
-        if (a->nfa_status != prev) {
+        if (changed) {
             vault_dirty = true;
             save_vault_if_dirty();
-            SAM_LOG_INFO("gc-validate: '{}' -> {}", a->login,
-                         a->nfa_status == core::NfaTokenStatus::Valid ? "Valid" : "Revoked");
-        }
-
-        if (a->nfa_status == core::NfaTokenStatus::Valid) {
-            nfa_dead_notified.erase(a->id);
-        } else if (a->nfa_status == core::NfaTokenStatus::Revoked &&
-                   prev != core::NfaTokenStatus::Revoked &&
-                   nfa_dead_notified.insert(a->id).second) {
-            ui::widgets::ToastItem t;
-            t.id = "nfa-revoked-" + a->id;
-            t.message = "NFA token revoked - " +
-                        (a->web.persona_name.empty() ? a->login : a->web.persona_name) +
-                        " (re-import a token)";
-            t.account_id = a->id;
-            t.is_warning = true;
-            t.expires_at_unix = now_unix() + settings.notifications.toast_duration_seconds;
-            toasts.push(std::move(t));
         }
     }
     if (timed_out && !v.finished)

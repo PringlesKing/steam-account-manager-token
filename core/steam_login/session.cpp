@@ -62,6 +62,19 @@ std::int64_t jwt_expiry(const crypto::SecureString& jwt) {
     return 0;
 }
 
+std::int64_t jwt_issued_at(const crypto::SecureString& jwt) {
+    if (jwt.empty()) return 0;
+    const std::string payload = jwt_payload(std::string_view{jwt.data(), jwt.size()});
+    if (payload.empty()) return 0;
+    try {
+        const auto j = json::parse(payload);
+        if (j.contains("iat")) return j["iat"].get<std::int64_t>();
+    } catch (...) {
+        return 0;
+    }
+    return 0;
+}
+
 std::uint64_t jwt_steam_id(const crypto::SecureString& jwt) {
     if (jwt.empty()) return 0;
     const std::string payload = jwt_payload(std::string_view{jwt.data(), jwt.size()});

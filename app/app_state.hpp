@@ -93,11 +93,14 @@ struct GcAutoPull {
 struct GcValidate {
     bool active = false;
     std::string status;  // progress text for the UI
-    std::vector<std::string> queue;  // vault ids to process (NFA/cached with a client token)
+    std::vector<std::string> queue;  // NFA/cached and full-access client-token account ids
     std::size_t idx = 0;
     int done = 0;  // finished (progress numerator)
 
     std::string current_id;
+    // Snapshot of the token used by this validation. Never invalidate a newer
+    // token minted/imported while the async CM login was in progress.
+    std::string token_at_start;
     std::uint32_t current_account_id = 0;  // 32-bit, matches on_profile
     std::unique_ptr<cs2_gc::Cs2GcClient> client;
     bool connected = false;      // puller posted on_status == "Ready"
@@ -106,9 +109,9 @@ struct GcValidate {
     int logon_eresult = 0;       // CM logon EResult (1 = OK)
     bool profile_applied = false;
     bool finished = false;       // on_profiles_done / on_error
-    // When set, this sweep is the NFA half of a "Refresh all": each finished account bumps
+    // When set, this token-validation sweep is part of "Refresh all": each account bumps
     // refresh_all_done (and resets the shared counter on the last one) so the toolbar shows a
-    // single N/Total across the GCPD scrape and the NFA GC logins.
+    // single N/Total across the GCPD scrape and per-account GC logins.
     bool feed_refresh_all = false;
     std::chrono::steady_clock::time_point phase_started{};
     std::chrono::steady_clock::time_point resume_at{};  // don't start the next account until here
@@ -508,8 +511,8 @@ struct AppState {
     void tick_gc_autopull();
     void cancel_gc_autopull();
 
-    // Per-account GC validate sweep for NFA/cached accounts: each connects with its own
-    // client token to validate it (CM logon -> nfa_status) and pull its OWN CS2 profile.
+    // Per-account GC validate sweep for NFA/cached and full-access client tokens:
+    // each connects with its own token and validates the CM logon result.
     // `force` ignores the GC cache TTL. `queue_gc_validate` adds one account (used on add).
     // tick_gc_validate() advances the sweep each frame; cancel stops it.
     void start_gc_validate(bool force);

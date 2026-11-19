@@ -19,6 +19,7 @@
 
 #include "app/job_pump.hpp"
 #include "core/account_store/store.hpp"
+#include "core/strings.hpp"
 #include "core/crypto/rng.hpp"
 #include "core/log.hpp"
 #include "core/sda/mafile.hpp"
@@ -29,6 +30,8 @@
 #include "core/steam_login/session.hpp"
 #include "core/time_aligner.hpp"
 #include "platform/clipboard.hpp"
+#include "platform/registry.hpp"
+#include "platform/registry.hpp"
 #include "platform/file_dialog.hpp"
 #include "ui/theme.hpp"
 #include "ui/util.hpp"
@@ -233,7 +236,11 @@ void draw_edit_account_modal(app::AppState& state) {
         separator_text("NFA token");
         const bool revealed = reveal_until > now;
         if (acc->refresh_token.empty()) {
-            ImGui::TextDisabled("No token stored. Paste one below to set it.");
+            if (acc->nfa_status == core::NfaTokenStatus::Revoked)
+                ImGui::TextWrapped("The previous token was rejected or expired and has "
+                                   "been removed. Import a new token below.");
+            else
+                ImGui::TextDisabled("No token stored. Paste one below to set it.");
         } else if (revealed) {
             ImGui::PushTextWrapPos(0.0F);
             ImGui::TextUnformatted(full_token.c_str());
@@ -246,8 +253,14 @@ void draw_edit_account_modal(app::AppState& state) {
                 reveal_until = revealed ? 0 : (now + 30);
             ImGui::SameLine();
             if (action_button("Copy token")) {
+                // Steam can rotate the refresh token on desktop sign-in.
+                // Prefer the token currently persisted by Steam for this user.
+                const auto active = platform::registry::read_active_user();
+                if (active && *active == static_cast<std::uint32_t>(acc->steam_id_64))
+                    state.capture_rotated_token_now(acc->id, core::to_lower(acc->login));
+                const std::string latest(acc->refresh_token.begin(), acc->refresh_token.end());
                 platform::clipboard::set_text_with_auto_clear(
-                    full_token,
+                    full_login_token(*acc, latest),
                     std::chrono::seconds(state.settings.clipboard_clear_seconds));
             }
             hover_tooltip("Copies the full login----JWT token; the clipboard auto-clears.");
@@ -353,10 +366,12 @@ void draw_edit_account_modal(app::AppState& state) {
         if (jwt.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                                   ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::TextWrapped("No login token stored yet. One is minted the first time this "
-                               "account signs in through token injection, or now from the "
-                               "stored password.");
+            ImGui::TextWrapped("No valid login token stored. Mint one using the saved "
+                               "password, or sign in through token injection.");
             ImGui::PopStyleColor();
+            if (acc->cm_status == core::NfaTokenStatus::Revoked)
+                ImGui::TextWrapped("Steam rejected the previous token. It was removed "
+                                   "so you can mint a replacement.");
 
             const bool minting = mint_account_id == acc->id;
             const bool can_mint = !acc->password.empty();
@@ -396,9 +411,14 @@ void draw_edit_account_modal(app::AppState& state) {
                 reveal_until = revealed ? 0 : (now + 30);
             ImGui::SameLine();
             if (action_button("Copy token")) {
-                platform::clipboard::set_text_with_auto_clear(
-                    full_token,
-                    std::chrono::seconds(state.settings.clipboard_clear_seconds));
+                const auto active = platform::registry::read_active_user();
+                if (active && *active == static_cast<std::uint32_t>(acc->steam_id_64))
+                    state.capture_rotated_token_now(acc->id, core::to_lower(acc->login));
+                const std::string latest = app::cs2_client_token(*acc);
+                if (!latest.empty())
+                    platform::clipboard::set_text_with_auto_clear(
+                        full_login_token(*acc, latest),
+                        std::chrono::seconds(state.settings.clipboard_clear_seconds));
             }
             hover_tooltip("Copies the full login----JWT token. Steam rotates it on every "
                           "sign-in, so a copy goes stale once this PC signs in again.");

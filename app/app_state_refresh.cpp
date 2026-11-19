@@ -9,6 +9,7 @@
 
 #include "app/job_pump.hpp"
 #include "core/account_store/ban_diff.hpp"
+#include "core/account_store/token_lifecycle.hpp"
 #include "core/crypto/rng.hpp"
 #include "core/http/client.hpp"
 #include "core/launch/first_login_reapply.hpp"
@@ -52,6 +53,20 @@ apply_diff_and_snapshot(AppState& state, core::Account& a,
     a.prev_snapshot.snapshot_unix = now;
     return persisted;
 }
+
+// Clearing local expired tokens requires no Steam request. A later Mint action
+// regenerates the full-access client token; NFA accounts can re-import one.
+void forget_expired_client_token(AppState& state, core::Account& a) {
+    if (a.is_nfa || a.cm_refresh_token.empty()) return;
+    const std::int64_t exp = steam_login::jwt_expiry(a.cm_refresh_token);
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    if (exp > now) return;
+    core::forget_rejected_login_token(a);
+    a.cm_last_validated_unix = now;
+    state.vault_dirty = true;
+    state.save_vault_if_dirty();
+}
 }  // namespace
 
 std::int64_t AppState::refresh_cooldown_seconds(const std::string& id) const {
@@ -75,6 +90,8 @@ std::int64_t AppState::persona_change_cooldown_seconds(const std::string& id) co
 }
 
 void AppState::refresh_account_data(bool force, bool announce) {
+    for (auto& account : vault.accounts)
+        forget_expired_client_token(*this, account);
     if (settings.web_api_key.empty()) {
         SAM_LOG_WARN("refresh_all: no web API key");
         refresh_web_phase_done.store(true, std::memory_order_relaxed);
@@ -277,6 +294,7 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                                       bool allow_gcpd) {
     auto* acc = find_account(id);
     if (!acc) { SAM_LOG_WARN("refresh: account '{}' not found", id); return; }
+    forget_expired_client_token(*this, *acc);
     if (settings.web_api_key.empty()) { SAM_LOG_WARN("refresh: no web API key configured"); return; }
     if (refreshing_ids.count(id)) { return; }
 
@@ -531,7 +549,8 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                                        level, games,
                                        mm_parsed = std::move(mm_parsed),
                                        am_parsed = std::move(am_parsed),
-                                       token_refreshed, nfa_token_dead,
+                                       token_refreshed, nfa_token_dead, is_nfa,
+                                       checked_refresh_token = creds.refresh_token,
                                        refreshed_at = std::move(refreshed_at),
                                        refreshed_rt = std::move(refreshed_rt),
                                        refreshed_ls = std::move(refreshed_ls),
@@ -628,7 +647,14 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                 pending_relogin_login = relogin_login;
             }
 
-            if (nfa_token_dead && nfa_dead_notified.insert(aid).second) {
+            if (is_nfa && a->is_nfa && nfa_token_dead &&
+                a->refresh_token == checked_refresh_token) {
+                core::forget_rejected_login_token(*a);
+                a->nfa_last_validated_unix = now_unix;
+                vault_dirty = true;
+            }
+            if (nfa_token_dead && a->nfa_status == core::NfaTokenStatus::Revoked &&
+                nfa_dead_notified.insert(aid).second) {
                 const std::string who = a->web.persona_name.empty()
                                             ? a->login : a->web.persona_name;
                 const std::string msg = "NFA token expired - " + who +
@@ -657,11 +683,9 @@ void AppState::pull_all_for_account(const std::string& id) {
     const bool nfa = a->is_nfa;
 
     refresh_single_account(id);
-    if (nfa) {
-
-        queue_gc_validate(id);
-    } else {
-
+    // Validate both imported NFA and minted full-access client tokens.
+    queue_gc_validate(id);
+    if (!nfa) {
         refresh_spend(id, true);
         start_gc_autopull();
     }
@@ -985,24 +1009,39 @@ namespace {
 
 bool adopt_connect_cache_token_into(core::Account& a, const std::string& login_lower,
                                     crypto::SecureString& dest,
-                                    std::int64_t& dest_expires) {
+                                    std::int64_t& dest_expires,
+                                    bool confirmed_signin = false) {
     auto fresh = steam_local::read_connect_cache_token(login_lower);
     if (!fresh || fresh->empty()) return false;
     const std::int64_t exp = steam_login::jwt_expiry(*fresh);
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    if (exp != 0 && exp <= now) return false;
+    if (exp <= now) return false;
     if (steam_login::jwt_steam_id(*fresh) != a.steam_id_64) return false;
     if (steam_login::jwt_audience(*fresh).find("client") == std::string::npos) return false;
     if (dest == *fresh) return false;
+    if (!dest.empty()) {
+        const std::int64_t old_issued = steam_login::jwt_issued_at(dest);
+        const std::int64_t new_issued = steam_login::jwt_issued_at(*fresh);
+        if (old_issued > 0 && new_issued > 0) {
+            // A local cache may still contain the token from a *previous*
+            // Steam login. Never replace a newer mint with that stale JWT.
+            if (new_issued < old_issued ||
+                (!confirmed_signin && new_issued == old_issued)) return false;
+        } else {
+            const std::int64_t old_exp = steam_login::jwt_expiry(dest);
+            if (exp < old_exp || (!confirmed_signin && exp <= old_exp)) return false;
+        }
+    }
     dest = std::move(*fresh);
     dest_expires = exp;
     return true;
 }
 
-bool adopt_connect_cache_token(core::Account& a, const std::string& login_lower) {
+bool adopt_connect_cache_token(core::Account& a, const std::string& login_lower,
+                               bool confirmed_signin = false) {
     return adopt_connect_cache_token_into(a, login_lower, a.refresh_token,
-                                          a.refresh_token_expires);
+                                          a.refresh_token_expires, confirmed_signin);
 }
 
 std::int64_t now_unix() {
@@ -1039,7 +1078,13 @@ void AppState::capture_rotated_token_now(const std::string& account_id,
                                          const std::string& login_lower) {
     auto* a = find_account(account_id);
     if (!a || a->steam_id_64 == 0 || login_lower.empty()) return;
-    if (adopt_connect_cache_token(*a, login_lower)) {
+    const bool updated = a->is_nfa
+        ? adopt_connect_cache_token(*a, login_lower)
+        : adopt_connect_cache_token_into(*a, login_lower,
+                                         a->cm_refresh_token, a->cm_refresh_token_expires);
+    if (updated) {
+        if (a->is_nfa) a->nfa_status = core::NfaTokenStatus::Unknown;
+        else           a->cm_status = core::NfaTokenStatus::Unknown;
         vault_dirty = true;
         save_vault_if_dirty();
     }
@@ -1081,7 +1126,10 @@ void AppState::capture_rotated_token_async(std::string account_id,
         post_ui_callback([this, account_id, login_lower] {
             auto* a = find_account(account_id);
             if (!a) return;
-            if (adopt_connect_cache_token(*a, login_lower)) {
+            if (adopt_connect_cache_token(*a, login_lower, true)) {
+                a->nfa_status = core::NfaTokenStatus::Unknown;
+                a->nfa_last_validated_unix = 0;
+                nfa_dead_notified.erase(account_id);
                 vault_dirty = true;
                 save_vault_if_dirty();
                 SAM_LOG_INFO("token self-heal: updated refresh_token for '{}'", a->login);
@@ -1095,9 +1143,12 @@ void AppState::verify_cm_token_signin_async(std::string account_id,
                                             std::string login_lower) {
     if (account_id.empty() || steam_id_64 == 0 || login_lower.empty()) return;
     const auto target = static_cast<std::uint32_t>(steam_id_64 & 0xFFFFFFFFull);
+    const auto* initial = find_account(account_id);
+    if (!initial) return;
+    const auto token_at_launch = initial->cm_refresh_token;
 
     job_pump::submit([this, account_id = std::move(account_id), target,
-                      login_lower = std::move(login_lower)]() mutable {
+                      token_at_launch, login_lower = std::move(login_lower)]() mutable {
         using namespace std::chrono;
         const auto poll = poll_for_signin(target);
         if (poll == SignInPoll::Aborted) return;
@@ -1107,27 +1158,26 @@ void AppState::verify_cm_token_signin_async(std::string account_id,
             post_ui_callback([this, account_id] {
                 auto* a = find_account(account_id);
                 if (a == nullptr) return;
-                a->cm_status = core::NfaTokenStatus::Revoked;
-                a->cm_last_validated_unix = now_unix();
-                vault_dirty = true;
-                save_vault_if_dirty();
-                SAM_LOG_WARN("cm-token: Steam never signed in for '{}' - marking revoked",
+                // A 90-second timeout does not prove the token was revoked:
+                // Steam could have been offline, prompting, or updating.
+                SAM_LOG_WARN("cm-token: Steam sign-in could not be confirmed for '{}'",
                              a->login);
-                remint_cm_token_after_revoke(account_id);
             });
             return;
         }
 
         if (!wait_out_first_login_reapply()) return;
         if (!job_pump::interruptible_sleep(seconds(3))) return;
-        post_ui_callback([this, account_id, login_lower] {
+        post_ui_callback([this, account_id, token_at_launch, login_lower] {
             auto* a = find_account(account_id);
-            if (a == nullptr) return;
+            if (a == nullptr || a->cm_refresh_token != token_at_launch) return;
+            const bool rotated = adopt_connect_cache_token_into(
+                *a, login_lower, a->cm_refresh_token, a->cm_refresh_token_expires, true);
+            // The only reliable way to know the token was accepted is the
+            // signed-in Steam client; only then mark it valid.
             a->cm_status = core::NfaTokenStatus::Valid;
             a->cm_last_validated_unix = now_unix();
             cm_relaunch_attempted.erase(account_id);
-            const bool rotated = adopt_connect_cache_token_into(
-                *a, login_lower, a->cm_refresh_token, a->cm_refresh_token_expires);
             if (rotated) {
                 SAM_LOG_INFO("cm-token self-heal: updated cm_refresh_token for '{}'", a->login);
             }

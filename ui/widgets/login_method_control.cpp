@@ -137,13 +137,13 @@ bool draw_login_split_button(app::AppState& state, core::Account& a, float total
         dl->AddRectFilled(origin, ImVec2(seam_x, br.y),
                           ImGui::GetColorU32(login_active ? ImGuiCol_ButtonActive
                                                           : ImGuiCol_ButtonHovered),
-                          kRounding, ImDrawFlags_RoundCornersLeft);
+                          kRounding, ImDrawFlags_RoundLeft);
     }
     if (caret_hovered || caret_active) {
         dl->AddRectFilled(ImVec2(seam_x, origin.y), br,
                           ImGui::GetColorU32(caret_active ? ImGuiCol_ButtonActive
                                                           : ImGuiCol_ButtonHovered),
-                          kRounding, ImDrawFlags_RoundCornersRight);
+                          kRounding, ImDrawFlags_RoundRight);
     }
     dl->AddLine(ImVec2(seam_x, origin.y + 4.0F), ImVec2(seam_x, br.y - 4.0F),
                 ImGui::GetColorU32(ImGuiCol_Separator), 1.0F);

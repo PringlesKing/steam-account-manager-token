@@ -281,6 +281,8 @@ JwtImportResult import_jwt_token(app::AppState& state, const std::string& raw,
     auto apply = [&](core::Account& a, bool fresh) {
         a.refresh_token = rt;
         a.refresh_token_expires = exp;
+        a.nfa_status = core::NfaTokenStatus::Unknown;
+        a.nfa_last_validated_unix = 0;
         if (sid != 0) a.steam_id_64 = sid;
         if (!login_hint.empty()) a.login = login_hint;
         if (a.session_id.empty()) a.session_id = crypto::random_session_id();

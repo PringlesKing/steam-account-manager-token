@@ -17,6 +17,10 @@ std::string make_steam_login_secure(std::uint64_t steam_id_64,
 // `exp` claim from a JWT, 0 if unparseable.
 std::int64_t jwt_expiry(const crypto::SecureString& jwt);
 
+// `iat` claim from a JWT, used to avoid replacing freshly minted tokens
+// with an older Steam ConnectCache entry.
+std::int64_t jwt_issued_at(const crypto::SecureString& jwt);
+
 // `aud` claim joined with commas, e.g. "mobile,web". Only tokens with "mobile"
 // in the audience are accepted by /mobileconf/ajaxop.
 std::string jwt_audience(const crypto::SecureString& jwt);

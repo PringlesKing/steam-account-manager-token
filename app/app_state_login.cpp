@@ -15,6 +15,7 @@
 #include "core/http/client.hpp"
 #include "core/http/url.hpp"
 #include "core/log.hpp"
+#include "core/steam_cm/cm_session.hpp"
 #include "core/steam_login/browser_login.hpp"
 #include "core/steam_login/mobile_auth.hpp"
 #include "core/steam_login/session.hpp"
@@ -123,8 +124,9 @@ void AppState::acquire_cm_token(const std::string& account_id,
     creds.password = a->password;
     creds.sda = a->sda;
     creds.proxy = a->proxy;
+    const std::uint64_t expected_steam_id = a->steam_id_64;
 
-    job_pump::submit([this, aid, creds, on_done = std::move(on_done)]() mutable {
+    job_pump::submit([this, aid, expected_steam_id, creds, on_done = std::move(on_done)]() mutable {
         http::ScopedProxy proxy_guard(std::string(creds.proxy.data(), creds.proxy.size()));
         steam_login::MobileLogin login;
         login.username = creds.login;
@@ -149,17 +151,46 @@ void AppState::acquire_cm_token(const std::string& account_id,
 
         crypto::SecureString rt = std::move(result.refresh_token);
         const std::int64_t exp = result.expires;
-        post_ui_callback([this, aid, rt = std::move(rt), exp, on_done = std::move(on_done)]() mutable {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (steam_login::jwt_audience(rt).find("client") == std::string::npos ||
+            exp <= now + kCmTokenExpiryMargin ||
+            (expected_steam_id != 0 && result.steam_id != expected_steam_id)) {
+            post_ui_callback([on_done = std::move(on_done)]() mutable {
+                if (on_done) on_done(false, "Steam returned an invalid client token");
+            });
+            return;
+        }
+        std::string verify_error;
+        steam_cm::CmSession verify_cm;
+        const bool accepted = verify_cm.connect(
+            std::string(rt.begin(), rt.end()), result.steam_id, verify_error);
+        verify_cm.disconnect();
+        if (!accepted) {
+            post_ui_callback([on_done = std::move(on_done),
+                              err = std::move(verify_error)]() mutable {
+                if (on_done) on_done(false, "New token was not accepted by Steam: " + err);
+            });
+            return;
+        }
+        const std::uint64_t steam_id = result.steam_id;
+        post_ui_callback([this, aid, rt = std::move(rt), steam_id, exp,
+                          on_done = std::move(on_done)]() mutable {
             if (auto* acc = find_account(aid)) {
+                if (acc->steam_id_64 == 0) acc->steam_id_64 = steam_id;
                 acc->cm_refresh_token = std::move(rt);
                 acc->cm_refresh_token_expires = exp;
 
-                acc->cm_status = core::NfaTokenStatus::Unknown;
-                acc->cm_last_validated_unix = 0;
+                acc->cm_status = core::NfaTokenStatus::Valid;
+                acc->cm_last_validated_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                nfa_dead_notified.erase(aid);
                 vault_dirty = true;
                 save_vault_if_dirty();
+                if (on_done) on_done(true, std::string{});
+            } else if (on_done) {
+                on_done(false, "Account was removed while minting the token");
             }
-            if (on_done) on_done(true, std::string{});
         });
     });
 }
